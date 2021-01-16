@@ -110,7 +110,7 @@ static float const coscof[] = {
     4.166664568298827E-002f
 };
 
-float I_sinf(float xx)
+static float I_sinf(float xx)
 {
     float const *p;
     float x, y, z;
@@ -198,7 +198,7 @@ float I_sinf(float xx)
  * rms relative error: 2.2e-8
  */
 
-float I_cosf( float xx )
+static float I_cosf( float xx )
 {
     float x, y, z;
     int j, sign;
