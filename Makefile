@@ -1,6 +1,6 @@
 cc = clang-cl
-flags = -nologo -W4 -GS- -Oi -O1 -c
-link_flags = -nodefaultlib -subsystem:windows -entry:entry main.obj \
+flags = -nologo -W4 -GS- -Oi -O1 -c -Xclang -std=c11 -Xclang -pedantic
+link_flags = -nodefaultlib -subsystem:console -entry:entry main.obj \
 			 uuid.lib kernel32.lib user32.lib ole32.lib shell32.lib \
 			 -out:prog.exe
 

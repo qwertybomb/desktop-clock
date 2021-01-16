@@ -15,6 +15,9 @@
 #include "sinf.c"
 
 #define PI_f 3.1415926f
+#define CIRCLE_TOTAL_POINTS 12
+#define LINE_TOTAL_POINTS 6
+#define TOTAL_POINTS (LINE_TOTAL_POINTS * 3 + CIRCLE_TOTAL_POINTS)
 
 static inline float I_roundf(float const x)
 {
@@ -158,39 +161,31 @@ static void I_IconArray_update(IconArray *const self,
 static void I_draw_circle(IconArray const icons, int *const icons_used,
                           int const width, int const height)
 {
-    #define TOTAL_POINTS 12
-
     float const circle_radius = (float) (height < width ? height : width) / 2.75f;
-    for (int i = 0; i < TOTAL_POINTS && *icons_used < icons.size; ++i)
+    for (int i = 0; i < CIRCLE_TOTAL_POINTS && *icons_used < icons.size; ++i)
     {
-        float const angle = ((float) i / (float) TOTAL_POINTS) * 2 * PI_f;
+        float const angle = ((float) i / (float) CIRCLE_TOTAL_POINTS) * 2 * PI_f;
         icons.point_data[(*icons_used)++] = (POINT) {
             .x = width / 2 - (long) I_roundf(I_cosf(angle) * circle_radius),
             .y = height / 2 - (long) I_roundf(I_sinf(angle) * circle_radius),
         };
 
     }
-
-    #undef TOTAL_POINTS
 }
 
 static void I_draw_circle_line(IconArray const icons, int *const icons_used,
                                int const width, int const height,
                                float const angle)
 {
-    #define TOTAL_POINTS 6
-
     float const circle_radius = (float) (height < width ? height : width) / 2.75f;
-    for (int i = 0; i < TOTAL_POINTS && *icons_used < icons.size; ++i)
+    for (int i = 0; i < LINE_TOTAL_POINTS && *icons_used < icons.size; ++i)
     {
-        float const percentage = (float) i / (float) TOTAL_POINTS;
+        float const percentage = (float) i / (float) LINE_TOTAL_POINTS;
         icons.point_data[(*icons_used)++] = (POINT) {
             .x = width / 2 - (long) I_roundf(I_cosf(angle) * circle_radius * percentage),
             .y = height / 2 - (long) I_roundf(I_sinf(angle) * circle_radius * percentage),
         };
     }
-
-    #undef TOTAL_POINTS
 }
 
 typedef struct
@@ -239,8 +234,51 @@ void *memset(void *dest, int c, size_t count)
     return dest;
 }
 
+static inline void I_add_icons(IFolderView2 *const folder_view,
+                               int *const file_handle_count,
+                               HANDLE *const file_handles)
+{
+    int icon_count;
+    IFolderView2_ItemCount(folder_view, SVGIO_ALLVIEW, &icon_count);
+
+    if (icon_count >= TOTAL_POINTS)
+    {
+        return; // we have enough icons
+    }
+
+
+    *file_handle_count = TOTAL_POINTS - icon_count;
+
+    static wchar_t file_path[MAX_PATH + 1];
+
+    wchar_t *string_pointer;
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0,
+                                    NULL, &string_pointer)))
+    {
+        ExitProcess(GetLastError());
+    }
+
+    for (int i = 0; i < TOTAL_POINTS - icon_count; ++i)
+    {
+        // NOTE: we don't need to explicitly add a null terminator as static memory is already zeroed
+        GetTempFileNameW(string_pointer, L"tmp", 0, file_path);
+        file_handles[i] = CreateFileW(file_path, GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      NULL, CREATE_NEW,
+                                      FILE_ATTRIBUTE_NORMAL |
+                                      FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    }
+
+    CoTaskMemFree(string_pointer);
+}
+
 void entry(void)
 {
+    // only really needed for development
+    #ifndef REAL_MSVC
+    _Static_assert(TOTAL_POINTS < '{' - '@', "Error: too many points");
+    #endif
+
     (void) _fltused;
     (void) entry;
 
@@ -248,15 +286,21 @@ void entry(void)
     if (SUCCEEDED(CoInitialize(NULL)) == FALSE)
     {
         MessageBoxW(NULL, L"could not create in initialize com", L"error", MB_OK);
-        ExitProcess(__LINE__);
+        ExitProcess(GetLastError());
     }
 
     IFolderView2 *const folder_view = I_get_folder_view();
     if (folder_view == NULL)
     {
         MessageBoxW(NULL, L"could not create an IFolderView2", L"error", MB_OK);
-        ExitProcess(__LINE__);
+        ExitProcess(GetLastError());
     }
+
+    int file_handle_count = 0;
+    static HANDLE file_handles[TOTAL_POINTS];
+
+    // add icons if there is not enough
+    I_add_icons(folder_view, &file_handle_count, file_handles);
 
     IconArray icon_array = {0};
     for (;;)
@@ -301,6 +345,12 @@ void entry(void)
         {
             break;
         }
+    }
+
+    // delete the files created
+    for(int i = 0; i < file_handle_count; ++i)
+    {
+        CloseHandle(file_handles[i]);
     }
 
     // uninitialize com
