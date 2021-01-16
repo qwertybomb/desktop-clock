@@ -234,9 +234,9 @@ void *memset(void *dest, int c, size_t count)
     return dest;
 }
 
-static inline void I_add_icons(IFolderView2 *const folder_view,
-                               int *const file_handle_count,
-                               HANDLE *const file_handles)
+static void I_add_icons(IFolderView2 *const folder_view,
+                            int *const file_handle_count,
+                            HANDLE *const file_handles)
 {
     int icon_count;
     IFolderView2_ItemCount(folder_view, SVGIO_ALLVIEW, &icon_count);
@@ -258,15 +258,32 @@ static inline void I_add_icons(IFolderView2 *const folder_view,
         ExitProcess(GetLastError());
     }
 
+    lstrcpynW(file_path, string_pointer, MAX_PATH);
+
+    int const file_path_length = lstrlenW(file_path);
     for (int i = 0; i < TOTAL_POINTS - icon_count; ++i)
     {
-        // NOTE: we don't need to explicitly add a null terminator as static memory is already zeroed
-        GetTempFileNameW(string_pointer, L"tmp", 0, file_path);
-        file_handles[i] = CreateFileW(file_path, GENERIC_WRITE,
-                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+        GUID guid;
+        CoCreateGuid(&guid);
+
+        int const left = StringFromGUID2(&guid, file_path + file_path_length,
+                                         MAX_PATH - file_path_length);
+
+        file_path[file_path_length] = '\\';
+        file_path[file_path_length + left - 2] = '\0';
+
+        file_handles[i] = CreateFileW(file_path, DELETE, 0,
                                       NULL, CREATE_NEW,
                                       FILE_ATTRIBUTE_NORMAL |
                                       FILE_FLAG_DELETE_ON_CLOSE, NULL);
+
+        // if the file already exists just try again
+        if (file_handles[i] == INVALID_HANDLE_VALUE &&
+            GetLastError() == ERROR_FILE_EXISTS)
+        {
+            --i;
+            continue;
+        }
     }
 
     CoTaskMemFree(string_pointer);
@@ -335,7 +352,6 @@ void entry(void)
                            desktop_width, desktop_height,
                            I_time_to_angle(time_info.hours));
 
-        // set position of the icon
         IFolderView2_SelectAndPositionItems(folder_view, icons_drawn,
                                             (void *) icon_array.item_id_data,
                                             (void *) icon_array.point_data, SVSI_SELECT);
