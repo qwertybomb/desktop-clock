@@ -319,7 +319,7 @@ void entry(void)
     // add icons if there is not enough
     I_add_icons(folder_view, &file_handle_count, file_handles);
 
-    // update desktop after potentially added files
+    // update desktop after potentially adding files
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, NULL, NULL);
 
     // NOTE: the program could fail if someone removes an icon
