@@ -319,13 +319,18 @@ void entry(void)
     // add icons if there is not enough
     I_add_icons(folder_view, &file_handle_count, file_handles);
 
+    // update desktop after potentially added files
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, NULL, NULL);
+
+    // NOTE: the program could fail if someone removes an icon
+    // however if we don't need to call IFolderView2_ItemCount we can be faster
     IconArray icon_array = {0};
+    I_IconArray_update(&icon_array, folder_view);
+
     for (;;)
     {
         RECT desktop_rect;
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &desktop_rect, 0);
-
-        I_IconArray_update(&icon_array, folder_view);
 
         TimeInfo const time_info = I_get_local_time();
 
