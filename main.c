@@ -1,669 +1,376 @@
-#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS )
-#define _CRT_SECURE_NO_WARNINGS
-#endif
-
-// standard headers
-#include <omp.h>
-#include <math.h>
-#include <time.h>
-#include <stdio.h>
-#include <stdint.h>
 #include <stdbool.h>
-#include <immintrin.h>
 
-// opengl headers
-#include <GL/glew.h>
-
-// SDL2 headers
-#include <SDL2/SDL.h>
-
-#ifndef DEBUG_MODE
-#define DEBUG_MODE (0)
+#ifndef UNICODE
+#define UNICODE
 #endif
 
-#if DEBUG_MODE >= 1
-#define NDEBUG
-#endif
+#define COBJMACROS
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#include <Shlobj.h>
+#undef COBJMACROS
+#undef WIN32_LEAN_AND_MEAN
+#undef UNICODE
 
-#ifdef _MSC_VER
-#define _Alignas(x) __declspec(align(x))
-#endif
+#include "sinf.c"
 
-// external headers (these are not mine)
-#include "simdxorshift128plus.c"
-#define ARCBALL_CAMERA_IMPLEMENTATION
-#include "arcball_camera.h"
+#define PI_f 3.1415926f
+#define CIRCLE_TOTAL_POINTS 12
+#define LINE_TOTAL_POINTS 6
+#define TOTAL_POINTS (LINE_TOTAL_POINTS * 3 + CIRCLE_TOTAL_POINTS)
 
-// project headers
-#include "shaders.h"
-
-#define MAX_ITERATIONS (10)
-#define BAILOUT_NORM (4.0f)
-#define IMAGE_WIDTH (512)
-#define IMAGE_HEIGHT (512)
-#define IMAGE_DEPTH (512)
-#define TOTAL_SAMPLES (700000000)
-
-typedef uint32_t heatmap_t;
-typedef heatmap_t (*heatmap_image_t)[IMAGE_HEIGHT][IMAGE_WIDTH];
-typedef uint8_t (*heatmap_image_uint8_t)[IMAGE_HEIGHT][IMAGE_WIDTH];
-
-static __m256 random_v8sf(avx_xorshift128plus_key_t *const key)
+static inline float I_roundf(float const x)
 {
-    __m256i const as_int = avx_xorshift128plus(key);
-    __m256 const as_float = _mm256_cvtepi32_ps(as_int);
-    return  _mm256_mul_ps(as_float, _mm256_set1_ps(1.0f / (1u << 31) * 2.0f));
+    return (float)(int)(x + 0.5f);
 }
 
-static bool v8si_lt(__m256i a, __m256i b)
+static inline void *I_malloc(size_t const size)
 {
-    __m256i const pcmp = _mm256_cmpgt_epi32(b, a);
-    int const bitmask = _mm256_movemask_epi8(pcmp);
-    return bitmask != 0;
+    return HeapAlloc(GetProcessHeap(), 0, size);
 }
 
-static __m256i mandelbulb_set(__m256 const cx,
-                              __m256 const cy,
-                              __m256 const cz,
-                              __m256(*const orbit)[3])
+static inline bool I_free(void *const pointer)
 {
-    __m256 zx = cx;
-    __m256 zy = cy;
-    __m256 zz = cz;
-    __m256i iterations = _mm256_setzero_si256();
+    return HeapFree(GetProcessHeap(), 0, pointer);
+}
 
-    for(int i = 0; i < MAX_ITERATIONS; ++i)
+static IFolderView2 *I_get_folder_view(void)
+{
+    IShellWindows *shell_windows;
+    if (FAILED(CoCreateInstance(&CLSID_ShellWindows, NULL, CLSCTX_ALL,
+                                &IID_IShellWindows, (void **) &shell_windows)))
     {
-        // test if we have done enough iterations
-        __m256i const pcmp = _mm256_cmpeq_epi32(_mm256_set1_epi32(MAX_ITERATIONS), iterations);
-        int const bitmask = _mm256_movemask_epi8(pcmp);
-        if (bitmask != 0u)
+        return NULL;
+    }
+
+    bool failed = false;
+
+    long window_handle;
+    IDispatch *window_dispatch;
+    if (FAILED(IShellWindows_FindWindowSW(shell_windows,
+                                          (&(VARIANT) {
+                                              .vt = VT_I4,
+                                              .intVal = CSIDL_DESKTOP,
+                                          }), &(VARIANT) {.vt = VT_EMPTY},
+                                          SWC_DESKTOP, &window_handle,
+                                          SWFO_NEEDDISPATCH, &window_dispatch)))
+    {
+        failed = true;
+        goto shell_window_cleanup;
+    }
+
+    IServiceProvider *service_provider;
+    if (FAILED(IDispatch_QueryInterface(window_dispatch,
+                                        &IID_IServiceProvider,
+                                        (void **) &service_provider)))
+    {
+        failed = true;
+        goto window_dispatch_cleanup;
+    }
+
+    IShellBrowser *shell_browser;
+    if (FAILED((IServiceProvider_QueryService(service_provider,
+                                              &SID_STopLevelBrowser,
+                                              &IID_IShellBrowser,
+                                              (void **) &shell_browser))))
+    {
+        failed = true;
+        goto service_provider_cleanup;
+    }
+
+    IShellView *shell_view;
+    if (IShellBrowser_QueryActiveShellView(shell_browser, &shell_view))
+    {
+        failed = true;
+        goto shell_browser_cleanup;
+    }
+
+    IFolderView2 *folder_view;
+    if (FAILED(IShellView_QueryInterface(shell_view,
+                                         &IID_IFolderView2,
+                                         (void **) &folder_view)))
+    {
+        return NULL;
+    }
+
+    IShellView_Release(shell_view);
+
+    shell_browser_cleanup:
+    IShellBrowser_Release(shell_browser);
+
+    service_provider_cleanup:
+    IServiceProvider_Release(service_provider);
+
+    window_dispatch_cleanup:
+    IShellDispatch_Release(window_dispatch);
+
+    shell_window_cleanup:
+    IShellWindows_Release(shell_windows);
+
+    if (failed)
+    {
+        return NULL;
+    }
+
+    return folder_view;
+}
+
+typedef struct
+{
+    ITEMIDLIST **item_id_data;
+    POINT *point_data;
+    int size, capacity;
+} IconArray;
+
+static void I_IconArray_update(IconArray *const self,
+                               IFolderView2 *const folder_view)
+{
+    // we only need to update if the number of icons changed
+    int icon_count;
+    IFolderView2_ItemCount(folder_view, SVGIO_ALLVIEW, &icon_count);
+    if (icon_count == self->size) return;
+
+    // destroy old icons
+    for (int i = 0; i < self->size; ++i)
+    {
+        CoTaskMemFree(self->item_id_data[i]);
+    }
+
+    if (icon_count > self->capacity)
+    {
+        if (self->point_data != NULL && self->item_id_data != NULL)
         {
-            break;
+            I_free(self->point_data);
+            I_free(self->item_id_data);
         }
 
-        //  from https://www.iquilezles.org/www/articles/mandelbulb/mandelbulb.htm
-        __m256 const x = zx;
-        __m256 const x2 = _mm256_mul_ps(x, x);
-        __m256 const x4 = _mm256_mul_ps(x2, x2);
+        self->capacity = icon_count;
+        self->point_data = I_malloc(sizeof *self->point_data * self->capacity);
 
-        __m256 const y = zy;
-        __m256 const y2 = _mm256_mul_ps(y, y);
-        __m256 const y4 = _mm256_mul_ps(y2, y2);
-
-        __m256 const z = zz;
-        __m256 const z2 = _mm256_mul_ps(z, z);
-        __m256 z4 = _mm256_mul_ps(z2, z2);
-
-        __m256 const k3 = _mm256_add_ps(x2, z2);
-        __m256 const k2 = _mm256_rsqrt_ps(
-            _mm256_mul_ps(
-                _mm256_mul_ps(
-                    _mm256_mul_ps(_mm256_mul_ps(k3, k3), k3),
-                    _mm256_mul_ps(_mm256_mul_ps(k3, k3), k3)), k3));
-
-        __m256 const k1 =
-            _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_set1_ps(2.0f), z2), x2,
-                _mm256_sub_ps(
-                    _mm256_sub_ps(
-                        _mm256_add_ps(_mm256_add_ps(x4, y4), z4),
-                        _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(6.0f), y2), z2)),
-                    _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(6.0f), x2), y2)));
-        __m256 const k4 = _mm256_add_ps(_mm256_sub_ps(x2, y2), z2);
-
-        zx =
-            _mm256_mul_ps(
-                _mm256_mul_ps(
-                    _mm256_mul_ps(
-                        _mm256_mul_ps(
-                            _mm256_mul_ps(
-                                _mm256_mul_ps(
-                            _mm256_mul_ps(
-                                _mm256_set1_ps(64.0f), x), y), z),
-                            _mm256_sub_ps(x2, z2)), k4),
-                    _mm256_add_ps(
-                        _mm256_fmadd_ps(
-                            _mm256_mul_ps(
-                                _mm256_set1_ps(-6.0f), x2), z2, z4), x4)),
-                _mm256_mul_ps(k1, k2));
-
-        zy =
-            _mm256_fmadd_ps(
-                _mm256_mul_ps(
-                    _mm256_mul_ps(_mm256_set1_ps(-16.0f), y2),
-                    _mm256_mul_ps(k3, k4)), k4,
-                _mm256_mul_ps(k1, k1));
-
-        zz =
-            _mm256_mul_ps(
-                _mm256_mul_ps(
-                    _mm256_mul_ps(
-                        _mm256_mul_ps(
-                            _mm256_set1_ps(-8.0f), y), k4),
-                    _mm256_fmadd_ps(
-                        z4, z4,
-                        _mm256_fmadd_ps(
-                            _mm256_mul_ps(
-                                _mm256_mul_ps(
-                                    _mm256_set1_ps(-28.0f), x2), z2), z4,
-                            _mm256_fmadd_ps(
-                                _mm256_mul_ps(_mm256_set1_ps(70.0f), x4), z4,
-                                _mm256_fmadd_ps(
-                                    _mm256_mul_ps(
-                                        _mm256_mul_ps(
-                                            _mm256_set1_ps(-28.0f), x4), x2), z2,
-                                    _mm256_mul_ps(x4, x4)))))),
-                _mm256_mul_ps(k1, k2));
-
-        zx = _mm256_add_ps(zx, cx);
-        zy = _mm256_add_ps(zy, cy);
-        zz = _mm256_add_ps(zz, cz);
-
-        orbit[i][0] = zx;
-        orbit[i][1] = zy;
-        orbit[i][2] = zz;
-
-        // test to see if any of the points are in bounds
-        __m256i const bounded =
-            _mm256_castps_si256(
-                _mm256_cmp_ps(
-                    _mm256_fmadd_ps(zx, zx, _mm256_fmadd_ps(zy, zy, _mm256_mul_ps(zz, zz))),
-                    _mm256_set1_ps(BAILOUT_NORM), _CMP_LT_OS));
-
-        if (_mm256_testz_si256(bounded, bounded))
-        {
-            break;
-        }
-
-        iterations = _mm256_sub_epi32(iterations, bounded);
+        self->item_id_data = I_malloc(sizeof *self->item_id_data * self->capacity);
     }
 
-    // if a point did not escape we don't want to plot
-    return _mm256_andnot_si256(_mm256_cmpeq_epi32(
-                                   iterations,
-                                   _mm256_set1_epi32(MAX_ITERATIONS)),
-                               iterations);
-}
+    self->size = icon_count;
 
-static __m256 map_range(__m256 const input,
-                        __m256 const in_min,
-                        __m256 const in_max,
-                        __m256 const out_min,
-                        __m256 const out_max)
-{
-    return
-        _mm256_fmadd_ps(
-            _mm256_div_ps(
-                _mm256_sub_ps(out_max, out_min),
-                _mm256_sub_ps(in_max, in_min)),
-            _mm256_sub_ps(input, in_min), out_min);
-}
-
-static void generate_heatmap(heatmap_image_t const restrict heatmap,
-                             heatmap_t *const restrict max_value,
-                             int const individual_samples,
-                             int const id)
-{
-    avx_xorshift128plus_key_t rng_key;
-    avx_xorshift128plus_init(324, 4444, &rng_key);
-
-    // make sure different threads start out differently
-    for(int i = 0; i < id; ++i)
+    for (int i = 0; i < icon_count; ++i)
     {
-        avx_xorshift128plus_jump(&rng_key);
-    }
-
-    for(int i = 0; i < individual_samples; ++i)
-    {
-        __m256 const cx = random_v8sf(&rng_key);
-        __m256 const cy = random_v8sf(&rng_key);
-        __m256 const cz = random_v8sf(&rng_key);
-
-        int j = 0;
-        _Alignas(32) __m256 orbit[MAX_ITERATIONS][3] = {0};
-
-        __m256i const iterations = mandelbulb_set(cx, cy, cz, orbit);
-        for(__m256i i = _mm256_setzero_si256();
-            v8si_lt(i, iterations);
-            i = _mm256_add_epi32(i, _mm256_set1_epi32(1)), ++j)
-        {
-            __m256i const x = _mm256_cvtps_epi32(map_range(orbit[j][0],
-                                                           _mm256_set1_ps(-2.0f),
-                                                           _mm256_set1_ps(+2.0f),
-                                                           _mm256_set1_ps(0),
-                                                           _mm256_set1_ps(IMAGE_WIDTH - 1)));
-
-            __m256i const y = _mm256_cvtps_epi32(map_range(orbit[j][1],
-                                                           _mm256_set1_ps(-2.0f),
-                                                           _mm256_set1_ps(+2.0f),
-                                                           _mm256_set1_ps(0),
-                                                           _mm256_set1_ps(IMAGE_HEIGHT - 1)));
-
-            __m256i const z = _mm256_cvtps_epi32(map_range(orbit[j][2],
-                                                           _mm256_set1_ps(-2.0f),
-                                                           _mm256_set1_ps(+2.0f),
-                                                           _mm256_set1_ps(0),
-                                                           _mm256_set1_ps(IMAGE_DEPTH - 1)));
-
-            for(int lane = 0; lane < 8; ++lane)
-            {
-                typedef union index_access
-                {
-                    __m256i v;
-                    int32_t i[8];
-                } index_access_t;
-
-                int32_t const x_lane = (index_access_t){x}.i[lane];
-                int32_t const y_lane = (index_access_t){y}.i[lane];
-                int32_t const z_lane = (index_access_t){z}.i[lane];
-                int32_t const i_lane = (index_access_t){i}.i[lane];
-                int32_t const iterations_lane = (index_access_t){iterations}.i[lane];
-
-                if (i_lane < iterations_lane &&
-                    x_lane >= 0 && x_lane < IMAGE_WIDTH  &&
-                    y_lane >= 0 && y_lane < IMAGE_HEIGHT &&
-                    z_lane >= 0 && z_lane < IMAGE_DEPTH)
-                {
-                    heatmap_t const new_value = ++heatmap[z_lane][y_lane][x_lane];
-                    *max_value = *max_value < new_value ? new_value : *max_value;
-                }
-            }
-        }
+        IFolderView2_Item(folder_view, i, (void *) &self->item_id_data[i]);
     }
 }
 
-static void combine_heatmap(heatmap_image_t const restrict heatmap,
-                            heatmap_t *const restrict max_value,
-                            int const count)
+static void I_draw_circle(IconArray const icons, int *const icons_used,
+                          int const width, int const height)
 {
-    for (int z = IMAGE_DEPTH; z < IMAGE_DEPTH * count; ++z)
+    float const circle_radius = (float) (height < width ? height : width) / 2.75f;
+    for (int i = 0; i < CIRCLE_TOTAL_POINTS && *icons_used < icons.size; ++i)
     {
-        for (int y = IMAGE_HEIGHT; y < IMAGE_HEIGHT; ++y)
-        {
-            for (int x = 0; x < IMAGE_WIDTH; x += 8)
-            {
-                void *const dst = &heatmap[z % IMAGE_DEPTH][y][x];
-                void const *const src = &heatmap[z][y][x];
-                _mm256_store_si256(dst, _mm256_add_epi32(_mm256_load_si256(dst),
-                                                         _mm256_load_si256(src)));
-            }
-        }
-    }
-
-    for (int i = 0; i < count; ++i)
-    {
-        max_value[0] = max_value[i] > max_value[0] ? max_value[i] : max_value[0];
-    }
-}
-
-static heatmap_image_uint8_t transform_heatmap(heatmap_image_t const heatmap,
-                                               heatmap_t const max_value)
-{
-    // find the min heatmap value
-    heatmap_t min_value = ~(heatmap_t)0;
-    for(int z = 0; z < IMAGE_DEPTH; ++z)
-    {
-        for(int y = 0; y < IMAGE_HEIGHT; ++y)
-        {
-            for(int x = 0; x < IMAGE_WIDTH; ++x)
-            {
-                heatmap_t const value = heatmap[z][y][x];
-                min_value = min_value > value ? value : min_value;
-            }
-        }
-    }
-
-    float const max_value_float = (float)max_value;
-    heatmap_image_uint8_t const heatmap_image = (heatmap_image_uint8_t)heatmap;
-
-    for(int z = 0; z < IMAGE_DEPTH; ++z)
-    {
-        for(int y = 0; y < IMAGE_HEIGHT; ++y)
-        {
-            for(int x = 0; x < IMAGE_WIDTH; ++x)
-            {
-                heatmap_t const value = heatmap[z][y][x] - min_value;
-                heatmap_image[z][y][x] = (uint8_t)(logf(value) / logf(6.0f) / max_value_float * 255.0f + 0.5f);
-            }
-        }
-    }
-
-    return heatmap_image;
-}
-
-static void *allocate_aligned(size_t const size, size_t const alignment)
-{
-    size_t const mask = alignment - 1;
-    uintptr_t const mem = (uintptr_t) calloc(size + alignment, 1);
-    return (void *) ((mem + mask) & ~mask);
-}
-
-static GLuint load_volume_texture(heatmap_image_uint8_t const image)
-{
-    GLuint texture;
-    glGenTextures(1, &texture);
-
-    glBindTexture(GL_TEXTURE_3D, texture);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_RED,
-                 IMAGE_WIDTH, IMAGE_HEIGHT,
-                 IMAGE_DEPTH, 0, GL_RED,
-                 GL_UNSIGNED_BYTE, image);
-
-    return texture;
-}
-
-static GLuint compile_shaders(void)
-{
-    GLuint const vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
-    glCompileShader(vertex_shader);
-
-    GLuint const fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
-    glCompileShader(fragment_shader);
-
-#if DEBUG_MODE >= 1
-    GLint success;
-    char info_log[512];
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if(!success)
-    {
-        glGetShaderInfoLog(fragment_shader, 512, NULL, info_log);
-        fputs(info_log, stdout);
-    }
-#endif
-
-    GLuint const shader_program = glCreateProgram();
-
-    glAttachShader(shader_program, vertex_shader);
-    glAttachShader(shader_program, fragment_shader);
-    glLinkProgram(shader_program);
-
-    glUseProgram(shader_program);
-
-    return shader_program;
-}
-
-static void bind_volume_texture(GLuint const shader_program,
-                                GLuint const volume_texture)
-{
-    GLint const uniform_location = glGetUniformLocation(shader_program, "tex");
-
-    glUniform1i(uniform_location, 0);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_3D, volume_texture);
-}
-
-static heatmap_image_uint8_t generate_heatmap_image(char const *const filepath,
-                                                    bool const force_compute)
-{
-    if (filepath != NULL && !force_compute)
-    {
-        FILE *const file = fopen(filepath, "rb");
-
-        // if the file does not exist that means we are creating a new file
-        if (file == NULL)
-        {
-            goto file_did_not_exist;
-        }
-
-        heatmap_image_uint8_t const heatmap_image =
-            malloc(sizeof *heatmap_image * IMAGE_DEPTH);
-
-        fread(heatmap_image, 1, sizeof *heatmap_image * IMAGE_DEPTH, file);
-
-        fclose(file);
-
-        return heatmap_image;
-    }
-    else
-    {
-        file_did_not_exist:;
-        clock_t const start_clock = clock();
-
-        int const max_threads = omp_get_max_threads();
-        heatmap_image_t const heatmap =
-            allocate_aligned(sizeof *heatmap * IMAGE_DEPTH * max_threads +
-                             sizeof ***heatmap * max_threads , 32);
-
-        heatmap_t *const max_value = &heatmap[IMAGE_DEPTH * max_threads][0][0];
-
-        // generate the heatmap
-#pragma omp parallel
-        {
-            int const id = omp_get_thread_num();
-            generate_heatmap(&heatmap[IMAGE_DEPTH * id], &max_value[id],
-                             TOTAL_SAMPLES / max_threads, id);
-        }
-
-        // combine it from different threads
-        combine_heatmap(heatmap, max_value, max_threads);
-
-        // transform the heatmap so it is now an image not a heatmap
-        heatmap_image_uint8_t const heatmap_image = transform_heatmap(heatmap, max_value[0]);
-
-        clock_t const end_clock = clock();
-        printf("it took %f seconds\n", (double)(end_clock - start_clock) / CLOCKS_PER_SEC);
-
-        if (filepath != NULL)
-        {
-            FILE *const file = fopen(filepath, "wb");
-            fwrite(heatmap_image, 1, sizeof *heatmap_image * IMAGE_DEPTH, file);
-            fclose(file);
-        }
-
-
-        return heatmap_image;
-    }
-}
-
-int main(int const argc, char **const argv)
-{
-    (void)avx_xorshift128plus_shuffle32;
-
-    bool force_compute = false;
-    char const *cache_result_path = "3d.mandelbulb_heatmap_plot.3d.bin";
-    switch(argc)
-    {
-        case 0:
-        case 1: break;
-        default:
-        {
-            for(int i = 1; i < argc; ++i)
-            {
-                if (strncmp(argv[i], "--cache-result", sizeof "--cache-result" - 1) == 0)
-                {
-	            char const *const value = argv[i] + sizeof "--cache-result" - 1;
-                    if (value[0] == '=' && value[0] != value[1] != '\0')
-                    {
-                        cache_result_path = value + 1;
-                    }
-                    else if(value[0] == '=')
-                    {
-                        goto argument_error;
-                    }
-                }
-                else if(strcmp(argv[i], "--no-cache") == 0)
-                {
-                    cache_result_path = NULL;
-                }
-                else if (strncmp(argv[i], "--force-compute", sizeof "--force-compute" - 1) == 0)
-                {
-                    char const *const value = argv[i] + sizeof "--force-compute" - 1;
-                    if (value[0] == '=' && value[1] != '\0')
-                    {
-                        if(strcmp(value + 1, "true") == 0)
-                        {
-                            force_compute = true;
-                        }
-                        else if(strcmp(value + 1, "false") == 0)
-                        {
-                            force_compute = false;
-                        }
-                        else
-                        {
-                            goto argument_error;
-                        }
-                    }
-                    else if (value[0] != '\0')
-                    {
-                        goto argument_error;
-                    }
-                    else
-                    {
-                        force_compute = true;
-                    }
-                }
-                else
-                {
-                    argument_error:
-                    fprintf(stderr, "%s is not a valid argument\n", argv[i]);
-                    return EXIT_FAILURE;
-                }
-            }
-
-            break;
-        }
-    }
-
-    heatmap_image_uint8_t const heatmap_image =
-        generate_heatmap_image(cache_result_path, force_compute);
-
-    // init SDL
-    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER);
-
-    // create a window
-    int const window_width = 750;
-    int const window_height = 750;
-    SDL_Window *const window = SDL_CreateWindow("",
-                                                SDL_WINDOWPOS_UNDEFINED,
-                                                SDL_WINDOWPOS_UNDEFINED,
-                                                window_width, window_height,
-                                                SDL_WINDOW_OPENGL);
-
-    SDL_GL_CreateContext(window);
-
-    glewInit();
-
-    GLuint const texture = load_volume_texture(heatmap_image);
-    GLuint const shader = compile_shaders();
-
-    bind_volume_texture(shader, texture);
-
-    GLint const transform_uniform_location = glGetUniformLocation(shader, "transform");
-    glUniform1i(glGetUniformLocation(shader, "depth_steps"), IMAGE_DEPTH);
-
-    float pos[3] = { 0.0f, 0.0f, 1.5f };
-    float target[3] = { 0.0f, 0.0f, 0.0f };
-
-    // initialize "up" to be tangent to the sphere!
-    // up = cross(cross(look, world_up), look)
-    float up[3];
-    {
-        float look[3] = { target[0] - pos[0], target[1] - pos[1], target[2] - pos[2] };
-        float look_len = sqrtf(look[0] * look[0] + look[1] * look[1] + look[2] * look[2]);
-        look[0] /= look_len;
-        look[1] /= look_len;
-        look[2] /= look_len;
-
-        float const world_up[3] = { 0.0f, 1.0f, 0.0f };
-
-        float across[3] = {
-                look[1] * world_up[2] - look[2] * world_up[1],
-                look[2] * world_up[0] - look[0] * world_up[2],
-                look[0] * world_up[1] - look[1] * world_up[0],
+        float const angle = ((float) i / (float) CIRCLE_TOTAL_POINTS) * 2 * PI_f;
+        icons.point_data[(*icons_used)++] = (POINT) {
+            .x = width / 2 - (long) I_roundf(I_cosf(angle) * circle_radius),
+            .y = height / 2 - (long) I_roundf(I_sinf(angle) * circle_radius),
         };
 
-        up[0] = across[1] * look[2] - across[2] * look[1];
-        up[1] = across[2] * look[0] - across[0] * look[2];
-        up[2] = across[0] * look[1] - across[1] * look[0];
-
-        float up_len = sqrtf(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
-        up[0] /= up_len;
-        up[1] /= up_len;
-        up[2] /= up_len;
     }
+}
 
-    int old_cursor_x, old_cursor_y;
-    SDL_GetMouseState(&old_cursor_x, &old_cursor_y);
-
-    uint64_t old_time = SDL_GetPerformanceCounter();
-    uint64_t const performance_frequency = SDL_GetPerformanceFrequency();
-
-    for(;;)
+static void I_draw_circle_line(IconArray const icons, int *const icons_used,
+                               int const width, int const height,
+                               float const angle)
+{
+    float const circle_radius = (float) (height < width ? height : width) / 2.75f;
+    for (int i = 0; i < LINE_TOTAL_POINTS && *icons_used < icons.size; ++i)
     {
-        SDL_PumpEvents();
-        uint32_t const is_mouse_down = SDL_GetMouseState(NULL, NULL);
-        bool const mouse_down[2] = {
-                (is_mouse_down & SDL_BUTTON(SDL_BUTTON_MIDDLE)) != 0,
-                (is_mouse_down & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0
+        float const percentage = (float) i / (float) LINE_TOTAL_POINTS;
+        icons.point_data[(*icons_used)++] = (POINT) {
+            .x = width / 2 - (long) I_roundf(I_cosf(angle) * circle_radius * percentage),
+            .y = height / 2 - (long) I_roundf(I_sinf(angle) * circle_radius * percentage),
         };
-
-        int mouse_wheel_delta = 0;
-        for(SDL_Event event; SDL_PollEvent(&event) != 0; )
-        {
-            switch(event.type)
-            {
-                case SDL_QUIT:
-                {
-                    goto cleanup;
-                }
-
-                case SDL_MOUSEWHEEL:
-                {
-                    mouse_wheel_delta = event.wheel.y;
-                    break;
-                }
-            }
-        }
-
-        // update the camera
-        {
-            int new_cursor_x, new_cursor_y;
-            SDL_GetMouseState(&new_cursor_x, &new_cursor_y);
-
-            uint64_t const new_time = SDL_GetPerformanceCounter();
-            float const delta_time = (float)((double)(new_time - old_time) /
-                                             (double)performance_frequency);
-
-            float view[16];
-            arcball_camera_update(pos, target, up, view,
-                                  delta_time, 0.1f, 1.0f, 2.0f,
-                                  window_width, window_height,
-                                  old_cursor_x, new_cursor_x,
-                                  old_cursor_y, new_cursor_y,
-                                  mouse_down[0], mouse_down[1],
-                                  mouse_wheel_delta, 0);
-
-            old_cursor_x = new_cursor_x;
-            old_cursor_y = new_cursor_y;
-            old_time = new_time;
-
-            glUniformMatrix4fv(transform_uniform_location, 1, GL_FALSE, view);
-        }
-
-        // draw to the screen
-        {
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            SDL_GL_SwapWindow(window);
-        }
     }
+}
 
-    cleanup:
+typedef struct
+{
+    float seconds;
+    float minutes;
+    float hours;
+} TimeInfo;
+
+TimeInfo I_get_local_time(void)
+{
+    SYSTEMTIME local_time;
+    GetLocalTime(&local_time);
+
+    TimeInfo const result = {
+        .seconds = (float)local_time.wSecond / 60 + (float)local_time.wMilliseconds / 60000,
+        .minutes = (float)local_time.wMinute / 60 + result.seconds / 60,
+        .hours = result.minutes / 12 + (float)local_time.wHour / 12
+    };
+
+    return result;
+}
+
+static inline float I_time_to_angle(float const time)
+{
+    return (time + 0.25f) * PI_f * 2;
+}
+
+extern int _fltused;
+int _fltused = 0;
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define REAL_MSVC
+#endif
+
+#ifdef REAL_MSVC
+#pragma function(memset)
+#endif
+void *memset(void *dest, int c, size_t count)
+{
+    char *bytes = (char *)dest;
+    while (count-- != 0)
     {
-        SDL_GL_DeleteContext(window);
-        SDL_DestroyWindow(window);
+        *bytes++ = (char)c;
+    }
+    return dest;
+}
+
+static void I_add_icons(IFolderView2 *const folder_view,
+                            int *const file_handle_count,
+                            HANDLE *const file_handles)
+{
+    int icon_count;
+    IFolderView2_ItemCount(folder_view, SVGIO_ALLVIEW, &icon_count);
+
+    if (icon_count >= TOTAL_POINTS)
+    {
+        return; // we have enough icons
     }
 
-    return 0;
+
+    *file_handle_count = TOTAL_POINTS - icon_count;
+
+    static wchar_t file_path[MAX_PATH + 1];
+
+    wchar_t *string_pointer;
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0,
+                                    NULL, &string_pointer)))
+    {
+        ExitProcess(GetLastError());
+    }
+
+    lstrcpynW(file_path, string_pointer, MAX_PATH);
+
+    int const file_path_length = lstrlenW(file_path);
+    for (int i = 0; i < TOTAL_POINTS - icon_count; ++i)
+    {
+        GUID guid;
+        CoCreateGuid(&guid);
+
+        int const left = StringFromGUID2(&guid, file_path + file_path_length,
+                                         MAX_PATH - file_path_length);
+
+        file_path[file_path_length] = '\\';
+        file_path[file_path_length + left - 2] = '\0';
+
+        file_handles[i] = CreateFileW(file_path, DELETE, 0,
+                                      NULL, CREATE_NEW,
+                                      FILE_ATTRIBUTE_NORMAL |
+                                      FILE_FLAG_DELETE_ON_CLOSE, NULL);
+
+        // if the file already exists just try again
+        if (file_handles[i] == INVALID_HANDLE_VALUE &&
+            GetLastError() == ERROR_FILE_EXISTS)
+        {
+            --i;
+            continue;
+        }
+    }
+
+    CoTaskMemFree(string_pointer);
+}
+
+void entry(void)
+{
+    (void) _fltused;
+    (void) entry;
+
+    // initialize com
+    if (SUCCEEDED(CoInitialize(NULL)) == FALSE)
+    {
+        MessageBoxW(NULL, L"could not create in initialize com", L"error", MB_OK);
+        ExitProcess(GetLastError());
+    }
+
+    IFolderView2 *const folder_view = I_get_folder_view();
+    if (folder_view == NULL)
+    {
+        MessageBoxW(NULL, L"could not create an IFolderView2", L"error", MB_OK);
+        ExitProcess(GetLastError());
+    }
+
+    int file_handle_count = 0;
+    static HANDLE file_handles[TOTAL_POINTS];
+
+    // add icons if there is not enough
+    I_add_icons(folder_view, &file_handle_count, file_handles);
+
+    // update desktop after potentially adding files
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, NULL, NULL);
+
+    // NOTE: the program could fail if someone removes an icon
+    // however if we don't need to call IFolderView2_ItemCount we can be faster
+    IconArray icon_array = {0};
+    I_IconArray_update(&icon_array, folder_view);
+
+    for (;;)
+    {
+        RECT desktop_rect;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &desktop_rect, 0);
+
+        TimeInfo const time_info = I_get_local_time();
+
+        // prevent us from using more icons than we have
+        int icons_drawn = 0;
+
+        int const desktop_width = desktop_rect.right - desktop_rect.left;
+        int const desktop_height = desktop_rect.bottom - desktop_rect.top;
+
+        I_draw_circle(icon_array, &icons_drawn, desktop_width, desktop_height);
+
+        // draw the second hand
+        I_draw_circle_line(icon_array, &icons_drawn,
+                           desktop_width, desktop_height,
+                           I_time_to_angle(time_info.seconds));
+
+        // draw the minute hand
+        I_draw_circle_line(icon_array, &icons_drawn,
+                           desktop_width, desktop_height,
+                           I_time_to_angle(time_info.minutes));
+
+        // draw the hour hand
+        I_draw_circle_line(icon_array, &icons_drawn,
+                           desktop_width, desktop_height,
+                           I_time_to_angle(time_info.hours));
+
+        IFolderView2_SelectAndPositionItems(folder_view, icons_drawn,
+                                            (void *) icon_array.item_id_data,
+                                            (void *) icon_array.point_data, SVSI_SELECT);
+
+        if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+            (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+        {
+            break;
+        }
+    }
+
+    // delete the files created
+    for(int i = 0; i < file_handle_count; ++i)
+    {
+        CloseHandle(file_handles[i]);
+    }
+
+    // uninitialize com
+    CoUninitialize();
+
+    ExitProcess(0);
 }
